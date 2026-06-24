@@ -1,0 +1,13 @@
+[package]
+name = "glossa"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "6.0.0"
+flate2 = "1.1.9"
+iced = { version = "0.14.0", features = ["advanced"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+ureq = "3.3.0"
