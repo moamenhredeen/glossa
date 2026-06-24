@@ -4,6 +4,9 @@
 //! switcher) and Settings (install / uninstall editions, pick the active one).
 //! Installs download + build a per-edition SQLite database in-app, with progress.
 
+// Hide the console window on Windows for release builds (GUI app, no terminal).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod ui;
 
 use std::collections::HashMap;
@@ -520,8 +523,16 @@ fn subscription(_app: &App) -> Subscription<Message> {
 fn main() -> iced::Result {
     iced::application(App::new, update, view)
         .title("Glossa")
-        .decorations(false)
-        .transparent(true)
+        .window(window::Settings {
+            decorations: false,
+            transparent: true,
+            icon: window::icon::from_file_data(
+                include_bytes!("../assets/icons/glossa-icon-2.png"),
+                None,
+            )
+            .ok(),
+            ..Default::default()
+        })
         .subscription(subscription)
         .run()
 }
