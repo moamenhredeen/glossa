@@ -11,8 +11,8 @@ use iced::event::{self, Status};
 use iced::keyboard::key::Named;
 use iced::keyboard::Key;
 use iced::widget::{
-    button, column, combo_box, container, progress_bar, rich_text, row, scrollable, span,
-    text, text_input, Space,
+    button, column, combo_box, container, operation, progress_bar, rich_text, row, scrollable,
+    span, text, text_input, Space,
 };
 use iced::{
     color, font, keyboard, window, Border, Color, Element, Font, Length, Padding, Subscription,
@@ -218,8 +218,17 @@ impl App {
             Message::SearchSubmitted => {
                 self.screen = Screen::Result;
                 self.lookup();
+                self.search_word.clear();
             }
-            Message::Navigate(s) => self.screen = s,
+            Message::Navigate(s) => {
+                if s == self.screen {
+                    return Task::none();
+                }
+                self.screen = s;
+                if s == Screen::Search {
+                    return operation::focus("search_input");
+                }
+            }
             Message::LangSelected(l) => {
                 self.library.set_active_lang(&l);
                 self.active_lang = Some(l.clone());
@@ -298,6 +307,7 @@ impl App {
         container(
             column![
                 text_input("type a word", &self.search_word)
+                    .id("search_input")
                     .padding(10)
                     .on_input(Message::SearchInputChanged)
                     .on_submit(Message::SearchSubmitted),
