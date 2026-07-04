@@ -1,20 +1,20 @@
 //! Glossa — offline multi-edition dictionary.
-//!
-//! Two pages: Search (within the active edition, with a headword-language
-//! switcher) and Settings (install / uninstall editions, pick the active one).
-//! Installs download + build a per-edition SQLite database in-app, with progress.
 
 // Hide the console window on Windows for release builds (GUI app, no terminal).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod ui;
-
 use std::collections::HashMap;
 
-use iced::event::{self, Event, Status};
-use iced::keyboard::{self, key::Named, Key};
-use iced::widget::{column, combo_box, container, stack};
-use iced::{window, Element, Length, Subscription, Task};
+use iced::alignment::{Horizontal, Vertical};
+use iced::event::Event;
+use iced::event::{self, Status};
+use iced::widget::{
+    Space, button, column, combo_box, container, progress_bar, rich_text, row, scrollable, span,
+    text, text_input,
+};
+use iced::{
+    Border, Color, Element, Font, Length, Padding, Subscription, Task, Theme, color, font, window,
+};
 use rusqlite::Connection;
 
 use glossa::db::{self, LanguageInfo};
@@ -24,20 +24,33 @@ use glossa::model::entry::Entry;
 use glossa::model::library::Library;
 use glossa::paths;
 
+use glossa::model::catalog::EDITIONS;
+
+const MUTED: Color = color!(0x888888);
+const ACCENT: Color = color!(0x2a9d8f); // links / related words — the only colored thing
+
+fn main() -> iced::Result {
+    iced::application(App::new, App::update, App::view)
+        .title("Glossa")
+        .theme(App::theme)
+        .window(window::Settings {
+            // decorations: false,
+            // transparent: true,
+            icon: window::icon::from_file_data(
+                include_bytes!("../assets/icons/glossa-icon-2.png"),
+                None,
+            )
+            .ok(),
+            ..Default::default()
+        })
+        .subscription(subscription)
+        .run()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Search,
     Settings,
-}
-
-/// Which overlay (if any) is open. Both share one query/selection/list UI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Overlay {
-    None,
-    /// Command palette (Ctrl+K) — navigate between pages.
-    Command,
-    /// Word search (Ctrl+P) — autocomplete dictionary words.
-    Word,
 }
 
 /// Transient per-edition install state (shown on the Settings page).
@@ -48,6 +61,19 @@ pub enum InstallState {
     Failed(String),
 }
 
+/// A selectable headword language for the pick_list (name only).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lang {
+    pub code: String,
+    label: String,
+}
+
+impl std::fmt::Display for Lang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
 pub struct App {
     screen: Screen,
     library: Library,
@@ -56,8 +82,8 @@ pub struct App {
     languages: Vec<LanguageInfo>,
     active_lang: Option<String>,
     /// Searchable language switcher state + its currently selected option.
-    lang_state: combo_box::State<ui::search::Lang>,
-    lang_selected: Option<ui::search::Lang>,
+    lang_state: combo_box::State<Lang>,
+    lang_selected: Option<Lang>,
     query: String,
     results: Vec<Entry>,
     status: Option<String>,
@@ -67,19 +93,12 @@ pub struct App {
     history: Vec<(String, String)>,
     /// In-flight installs keyed by edition code.
     installs: HashMap<String, InstallState>,
-    // Overlay (command palette / word search)
-    overlay: Overlay,
-    palette_query: String,
-    palette_selected: usize,
-    /// Word-search autocomplete suggestions (Word overlay only).
-    word_suggestions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Navigate(Screen),
     Back,
-    GoToCrumb(usize),
     // Search page
     LangSelected(String),
     LinkClicked(String),
@@ -88,15 +107,6 @@ pub enum Message {
     Uninstall(String),
     SetActiveEdition(String),
     InstallProgress(String, Progress),
-    // Overlays (command palette / word search)
-    TogglePalette,
-    ToggleWordSearch,
-    ClosePalette,
-    PaletteAppend(String),
-    PaletteBackspace,
-    PaletteMoveSelection(i32),
-    PaletteRun,
-    PaletteRunIndex(usize),
     // Window chrome
     WindowDrag,
     WindowResize(window::Direction),
@@ -121,10 +131,6 @@ impl App {
             current_view: None,
             history: Vec::new(),
             installs: HashMap::new(),
-            overlay: Overlay::None,
-            palette_query: String::new(),
-            palette_selected: 0,
-            word_suggestions: Vec::new(),
         };
         app.open_active();
         app
@@ -158,11 +164,11 @@ impl App {
                             .map(|li| li.code.clone())
                     })
                     .or_else(|| self.languages.first().map(|li| li.code.clone()));
-                self.lang_state = combo_box::State::new(ui::search::lang_options(&self.languages));
+                self.lang_state = combo_box::State::new(lang_options(&self.languages));
                 self.lang_selected = self
                     .active_lang
                     .as_deref()
-                    .and_then(|c| ui::search::find_lang(&self.languages, c));
+                    .and_then(|c| find_lang(&self.languages, c));
                 self.conn = Some(conn);
                 self.status = None;
             }
@@ -199,48 +205,215 @@ impl App {
         }
     }
 
-    /// Start a fresh word search (from Ctrl+P): clears the navigation trail.
-    fn open_word(&mut self, word: String, lang: String) {
-        self.history.clear();
-        self.query = word.clone();
-        self.screen = Screen::Search;
-        self.lookup(&word, &lang);
+    fn theme(&self) -> Theme {
+        Theme::Dracula
     }
 
-    /// Jump to a breadcrumb entry, dropping everything after it.
-    fn go_to_crumb(&mut self, index: usize) {
-        if index < self.history.len() {
-            let (word, lang) = self.history[index].clone();
-            self.history.truncate(index);
-            self.query = word.clone();
-            self.lookup(&word, &lang);
-        }
-    }
-
-    /// Refresh word-search autocomplete from the current palette query.
-    fn refresh_word_suggestions(&mut self) {
-        self.word_suggestions.clear();
-        let (Some(conn), Some(lang)) = (&self.conn, &self.active_lang) else {
-            return;
-        };
-        self.word_suggestions =
-            db::search_words(conn, lang, &self.palette_query, 25).unwrap_or_default();
-    }
-
-    /// Navigate to a word in a given language: remember the current view for
-    /// Back, then look it up.
-    fn navigate(&mut self, word: String, lang: String) {
-        let trimmed = word.trim().to_string();
-        if !trimmed.is_empty()
-            && self.current_view.as_ref().map(|(w, _)| w.as_str()) != Some(trimmed.as_str())
-        {
-            if let Some(cur) = &self.current_view {
-                self.history.push(cur.clone());
+    fn update(app: &mut App, message: Message) -> Task<Message> {
+        match message {
+            Message::Navigate(s) => app.screen = s,
+            Message::LangSelected(l) => {
+                app.library.set_active_lang(&l);
+                app.active_lang = Some(l.clone());
+                app.lang_selected = find_lang(&app.languages, &l);
+                let q = app.query.clone();
+                app.lookup(&q, &l);
+            }
+            Message::LinkClicked(_) => {
+                // Links inside explanations always point to words in the edition's
+                // gloss language, so look them up there — without changing the user's
+                // selected headword language.
+                // if let Some(edition) = app.library.active_edition() {
+                //     let gloss = edition.code.to_string();
+                //     app.navigate(w, gloss);
+                // }
+            }
+            Message::Back => {
+                if let Some((word, lang)) = app.history.pop() {
+                    app.query = word.clone();
+                    app.screen = Screen::Search;
+                    app.lookup(&word, &lang);
+                }
+            }
+            Message::Install(code) => {
+                app.installs.insert(
+                    code.clone(),
+                    InstallState::Downloading {
+                        received: 0,
+                        total: None,
+                    },
+                );
+                return install_task(code);
+            }
+            Message::Uninstall(code) => {
+                let _ = std::fs::remove_file(paths::db_path(&code));
+                let was_active =
+                    app.library.active_edition().map(|e| e.code) == Some(code.as_str());
+                app.installs.remove(&code);
+                app.library.rescan();
+                if was_active {
+                    app.library.clear_active_edition();
+                    app.open_active();
+                }
+            }
+            Message::SetActiveEdition(code) => {
+                app.library.set_active_edition(&code);
+                app.open_active();
+            }
+            Message::InstallProgress(code, prog) => match prog {
+                Progress::Downloading { received, total } => {
+                    app.installs
+                        .insert(code, InstallState::Downloading { received, total });
+                }
+                Progress::Importing { entries } => {
+                    app.installs
+                        .insert(code, InstallState::Importing { entries });
+                }
+                Progress::Failed(e) => {
+                    app.installs.insert(code, InstallState::Failed(e));
+                }
+                Progress::Done { .. } => {
+                    app.installs.remove(&code);
+                    app.library.rescan();
+                    // Auto-activate if nothing is active yet.
+                    if app.library.active_edition().is_none() {
+                        app.library.set_active_edition(&code);
+                        app.open_active();
+                    }
+                }
+            },
+            Message::WindowDrag => {
+                return window::latest().then(|id| match id {
+                    Some(id) => window::drag(id),
+                    None => Task::none(),
+                });
+            }
+            Message::WindowResize(dir) => {
+                return window::latest().then(move |id| match id {
+                    Some(id) => window::drag_resize(id, dir),
+                    None => Task::none(),
+                });
+            }
+            Message::WindowMinimize => {
+                return window::latest().then(|id| match id {
+                    Some(id) => window::minimize(id, true),
+                    None => Task::none(),
+                });
+            }
+            Message::WindowMaximize => {
+                return window::latest().then(|id| match id {
+                    Some(id) => window::toggle_maximize(id),
+                    None => Task::none(),
+                });
+            }
+            Message::WindowClose => {
+                return window::latest().then(|id| match id {
+                    Some(id) => window::close(id),
+                    None => Task::none(),
+                });
             }
         }
-        self.query = word.clone();
-        self.screen = Screen::Search;
-        self.lookup(&word, &lang);
+        Task::none()
+    }
+
+    pub fn search_view(&self) -> Element<'_, Message> {
+        // Results, an empty hint, or a status message.
+        let body: Element<Message> = if let Some(status) = &self.status {
+            centered_hint(status.clone())
+        } else if self.results.is_empty() {
+            centered_hint("Press Ctrl+P to search a word.".to_string())
+        } else {
+            let mut col = column![].spacing(28).padding(Padding::from([0, 20]));
+            for (i, entry) in self.results.iter().enumerate() {
+                if i > 0 {
+                    col = col.push(divider());
+                }
+                col = col.push(entry_view(entry));
+            }
+            scrollable(col).height(Length::Fill).into()
+        };
+
+        let mut inner = column![].spacing(16).width(Length::Fill);
+        if !self.history.is_empty() {
+            inner = inner.push(breadcrumb(self));
+        }
+        inner = inner.push(body);
+
+        container(inner)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Center)
+            .into()
+    }
+
+    fn settings_view(&self) -> Element<'_, Message> {
+        let mut col = column![].padding(24).spacing(24);
+
+        let active = self.library.active_edition().map(|e| e.code);
+
+        for edition in EDITIONS {
+            let installed = self.library.is_installed(edition.code);
+            let installing = self.installs.get(edition.code);
+
+            // Left: name + size/status.
+            let title = text(edition.name).size(18);
+            let subtitle = text(if installed {
+                "Installed".to_string()
+            } else {
+                format!("{} download", edition.size)
+            })
+            .size(13);
+
+            // Right: action area depends on state.
+            let action: Element<Message> = if let Some(state) = installing {
+                install_status(state)
+            } else if installed {
+                let mut r = row![].spacing(8);
+                if active == Some(edition.code) {
+                    r = r.push(text("Active").size(14));
+                } else {
+                    r = r.push(
+                        button("Set active")
+                            .on_press(Message::SetActiveEdition(edition.code.to_string())),
+                    );
+                }
+                r = r.push(
+                    button("Uninstall").on_press(Message::Uninstall(edition.code.to_string())),
+                );
+                r.into()
+            } else {
+                button("Install")
+                    .on_press(Message::Install(edition.code.to_string()))
+                    .into()
+            };
+
+            let entry_row = row![
+                column![title, subtitle].spacing(2).width(Length::Fill),
+                action,
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center);
+
+            col = col.push(entry_row);
+        }
+
+        column![
+            container(text("Dictionaries").size(24)).padding(24),
+            scrollable(col)
+        ]
+        .spacing(24)
+        .into()
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let body = match self.screen {
+            Screen::Search => self.search_view(),
+            Screen::Settings => self.settings_view(),
+        };
+        container(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 }
 
@@ -259,280 +432,201 @@ fn install_task(code: String) -> Task<Message> {
     Task::run(rx, move |p| Message::InstallProgress(code.clone(), p))
 }
 
-/// Number of items in the currently open overlay's list.
-fn overlay_len(app: &App) -> usize {
-    match app.overlay {
-        Overlay::Command => ui::palette::matches(&app.palette_query).len(),
-        Overlay::Word => app.word_suggestions.len(),
-        Overlay::None => 0,
-    }
-}
-
-/// Run the selected item of the open overlay.
-fn run_palette(app: &mut App, index: usize) {
-    match app.overlay {
-        Overlay::Command => {
-            let results = ui::palette::matches(&app.palette_query);
-            if let Some(cmd) = results.get(index) {
-                app.screen = cmd.target;
-                app.overlay = Overlay::None;
-            }
-        }
-        Overlay::Word => {
-            if let Some(word) = app.word_suggestions.get(index).cloned() {
-                let lang = app.active_lang.clone().unwrap_or_default();
-                app.overlay = Overlay::None;
-                app.open_word(word, lang);
-            }
-        }
-        Overlay::None => {}
-    }
-}
-
-fn update(app: &mut App, message: Message) -> Task<Message> {
-    match message {
-        Message::Navigate(s) => app.screen = s,
-        Message::GoToCrumb(i) => app.go_to_crumb(i),
-        Message::LangSelected(l) => {
-            app.library.set_active_lang(&l);
-            app.active_lang = Some(l.clone());
-            app.lang_selected = ui::search::find_lang(&app.languages, &l);
-            let q = app.query.clone();
-            app.lookup(&q, &l);
-        }
-        Message::LinkClicked(w) => {
-            // Links inside explanations always point to words in the edition's
-            // gloss language, so look them up there — without changing the user's
-            // selected headword language.
-            if let Some(edition) = app.library.active_edition() {
-                let gloss = edition.code.to_string();
-                app.navigate(w, gloss);
-            }
-        }
-        Message::Back => {
-            if let Some((word, lang)) = app.history.pop() {
-                app.query = word.clone();
-                app.screen = Screen::Search;
-                app.lookup(&word, &lang);
-            }
-        }
-        Message::Install(code) => {
-            app.installs.insert(
-                code.clone(),
-                InstallState::Downloading {
-                    received: 0,
-                    total: None,
-                },
-            );
-            return install_task(code);
-        }
-        Message::Uninstall(code) => {
-            let _ = std::fs::remove_file(paths::db_path(&code));
-            let was_active = app.library.active_edition().map(|e| e.code) == Some(code.as_str());
-            app.installs.remove(&code);
-            app.library.rescan();
-            if was_active {
-                app.library.clear_active_edition();
-                app.open_active();
-            }
-        }
-        Message::SetActiveEdition(code) => {
-            app.library.set_active_edition(&code);
-            app.open_active();
-        }
-        Message::InstallProgress(code, prog) => match prog {
-            Progress::Downloading { received, total } => {
-                app.installs
-                    .insert(code, InstallState::Downloading { received, total });
-            }
-            Progress::Importing { entries } => {
-                app.installs.insert(code, InstallState::Importing { entries });
-            }
-            Progress::Failed(e) => {
-                app.installs.insert(code, InstallState::Failed(e));
-            }
-            Progress::Done { .. } => {
-                app.installs.remove(&code);
-                app.library.rescan();
-                // Auto-activate if nothing is active yet.
-                if app.library.active_edition().is_none() {
-                    app.library.set_active_edition(&code);
-                    app.open_active();
-                }
-            }
-        },
-        Message::TogglePalette => {
-            app.overlay = if app.overlay == Overlay::Command {
-                Overlay::None
-            } else {
-                Overlay::Command
-            };
-            app.palette_query.clear();
-            app.palette_selected = 0;
-            app.word_suggestions.clear();
-        }
-        Message::ToggleWordSearch => {
-            app.overlay = if app.overlay == Overlay::Word {
-                Overlay::None
-            } else {
-                Overlay::Word
-            };
-            app.palette_query.clear();
-            app.palette_selected = 0;
-            app.word_suggestions.clear();
-        }
-        Message::ClosePalette => app.overlay = Overlay::None,
-        Message::PaletteAppend(s) => {
-            if app.overlay != Overlay::None {
-                app.palette_query.push_str(&s);
-                app.palette_selected = 0;
-                if app.overlay == Overlay::Word {
-                    app.refresh_word_suggestions();
-                }
-            }
-        }
-        Message::PaletteBackspace => {
-            if app.overlay != Overlay::None {
-                app.palette_query.pop();
-                app.palette_selected = 0;
-                if app.overlay == Overlay::Word {
-                    app.refresh_word_suggestions();
-                }
-            }
-        }
-        Message::PaletteMoveSelection(d) => {
-            let len = overlay_len(app);
-            if len > 0 {
-                app.palette_selected =
-                    (app.palette_selected as i32 + d).rem_euclid(len as i32) as usize;
-            }
-        }
-        Message::PaletteRun => run_palette(app, app.palette_selected),
-        Message::PaletteRunIndex(i) => run_palette(app, i),
-        Message::WindowDrag => {
-            return window::latest().then(|id| match id {
-                Some(id) => window::drag(id),
-                None => Task::none(),
-            });
-        }
-        Message::WindowResize(dir) => {
-            return window::latest().then(move |id| match id {
-                Some(id) => window::drag_resize(id, dir),
-                None => Task::none(),
-            });
-        }
-        Message::WindowMinimize => {
-            return window::latest().then(|id| match id {
-                Some(id) => window::minimize(id, true),
-                None => Task::none(),
-            });
-        }
-        Message::WindowMaximize => {
-            return window::latest().then(|id| match id {
-                Some(id) => window::toggle_maximize(id),
-                None => Task::none(),
-            });
-        }
-        Message::WindowClose => {
-            return window::latest().then(|id| match id {
-                Some(id) => window::close(id),
-                None => Task::none(),
-            });
-        }
-    }
-    Task::none()
-}
-
-fn view(app: &App) -> Element<'_, Message> {
-    let body = match app.screen {
-        Screen::Search => ui::search::view(app),
-        Screen::Settings => ui::settings::view(app),
-    };
-    let content = container(body)
-        .width(Length::Fill)
-        .height(Length::Fill);
-
-    let lang_selector = ui::search::language_selector(app);
-    let inner = column![
-        ui::chrome::title_bar(app.screen, !app.history.is_empty(), lang_selector),
-        content
-    ];
-    let base = ui::chrome::window(inner.into());
-
-    match app.overlay {
-        Overlay::None => base,
-        Overlay::Command => {
-            let items: Vec<String> = ui::palette::matches(&app.palette_query)
-                .iter()
-                .map(|c| c.label.to_string())
-                .collect();
-            let overlay =
-                ui::palette::view(&app.palette_query, app.palette_selected, &items, "Type a command…");
-            stack![base, overlay].into()
-        }
-        Overlay::Word => {
-            let overlay = ui::palette::view(
-                &app.palette_query,
-                app.palette_selected,
-                &app.word_suggestions,
-                "Search a word…",
-            );
-            stack![base, overlay].into()
-        }
-    }
-}
-
-/// Map raw key events to palette messages. Ctrl/Cmd+K toggles the palette;
-/// other keys drive it (the `update` handlers ignore them unless it's open).
-fn on_event(event: Event, _status: Status, _id: window::Id) -> Option<Message> {
-    let Event::Keyboard(keyboard::Event::KeyPressed {
-        key,
-        modifiers,
-        text,
-        ..
-    }) = event
-    else {
-        return None;
-    };
-
-    if modifiers.command() {
-        if let Key::Character(c) = &key {
-            match c.as_str().to_ascii_lowercase().as_str() {
-                "k" => return Some(Message::TogglePalette),
-                "p" => return Some(Message::ToggleWordSearch),
-                _ => {}
-            }
-        }
-        return None;
-    }
-
-    match key {
-        Key::Named(Named::Escape) => Some(Message::ClosePalette),
-        Key::Named(Named::Enter) => Some(Message::PaletteRun),
-        Key::Named(Named::ArrowDown) => Some(Message::PaletteMoveSelection(1)),
-        Key::Named(Named::ArrowUp) => Some(Message::PaletteMoveSelection(-1)),
-        Key::Named(Named::Backspace) => Some(Message::PaletteBackspace),
-        _ => text.map(|t| Message::PaletteAppend(t.to_string())),
-    }
+fn on_event(_event: Event, _status: Status, _id: window::Id) -> Option<Message> {
+    None
 }
 
 fn subscription(_app: &App) -> Subscription<Message> {
     event::listen_with(on_event)
 }
 
-fn main() -> iced::Result {
-    iced::application(App::new, update, view)
-        .title("Glossa")
-        .window(window::Settings {
-            decorations: false,
-            transparent: true,
-            icon: window::icon::from_file_data(
-                include_bytes!("../assets/icons/glossa-icon-2.png"),
-                None,
-            )
-            .ok(),
-            ..Default::default()
+fn install_status(state: &InstallState) -> Element<'_, Message> {
+    match state {
+        InstallState::Downloading { received, total } => {
+            let label = match total {
+                Some(t) if *t > 0 => {
+                    format!("Downloading {:.0}%", (*received as f64 / *t as f64) * 100.0)
+                }
+                _ => format!("Downloading {:.1} MB", *received as f64 / 1_000_000.0),
+            };
+            let bar = match total {
+                Some(t) if *t > 0 => progress_bar(0.0..=*t as f32, *received as f32),
+                _ => progress_bar(0.0..=1.0, 0.0),
+            };
+            column![text(label).size(13), container(bar).width(200)]
+                .spacing(4)
+                .into()
+        }
+        InstallState::Importing { entries } => column![
+            text(format!("Importing… {entries} entries")).size(13),
+            container(progress_bar(0.0..=1.0, 0.5)).width(200),
+        ]
+        .spacing(4)
+        .into(),
+        InstallState::Failed(e) => text(format!("Failed: {e}")).size(13).into(),
+    }
+}
+
+/// Navigation trail: each previous word is a clickable crumb; the current word
+/// is shown plain at the end.
+fn breadcrumb(app: &App) -> Element<'_, Message> {
+    let mut trail = row![].spacing(6).align_y(Vertical::Center);
+    for (_i, (word, _lang)) in app.history.iter().enumerate() {
+        trail = trail.push(
+            button(text(word.clone()).size(13).color(ACCENT))
+                .style(button::text)
+                .padding(0),
+            //.on_press(Message::GoToCrumb(i)),
+        );
+        trail = trail.push(text("\u{203A}").size(13).color(MUTED)); // ›
+    }
+    if let Some((word, _)) = &app.current_view {
+        trail = trail.push(text(word.clone()).size(13).color(MUTED));
+    }
+    trail.into()
+}
+
+fn centered_hint(message: String) -> Element<'static, Message> {
+    container(text(message).size(15).color(MUTED))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .into()
+}
+
+/// Render a single entry: headword + POS, IPA, numbered senses, etymology.
+fn entry_view(entry: &Entry) -> Element<'static, Message> {
+    let bold = Font {
+        weight: font::Weight::Bold,
+        ..Font::default()
+    };
+    let italic = Font {
+        style: font::Style::Italic,
+        ..Font::default()
+    };
+
+    let mut col = column![].spacing(10);
+
+    // Headword (left, large+bold) with POS pushed to the right (muted).
+    col = col.push(
+        row![
+            text(entry.word.clone())
+                .size(30)
+                .font(bold)
+                .width(Length::Fill),
+            text(entry.pos.clone()).size(14).color(MUTED),
+        ]
+        .align_y(Vertical::Center),
+    );
+
+    // IPA, muted monospace.
+    let ipas: Vec<String> = entry.sounds.iter().filter_map(|s| s.ipa.clone()).collect();
+    if !ipas.is_empty() {
+        col = col.push(
+            text(ipas.join("   "))
+                .size(14)
+                .font(Font::MONOSPACE)
+                .color(MUTED),
+        );
+    }
+
+    // Senses.
+    let mut n = 0;
+    for sense in &entry.senses {
+        if sense.glosses.is_empty() {
+            continue;
+        }
+        n += 1;
+
+        let mut sense_col =
+            column![text(format!("{n}.  {}", sense.glosses.join("; "))).size(16)].spacing(6);
+
+        // Examples: plain italic muted, indented.
+        for ex in &sense.examples {
+            if ex.text.is_empty() {
+                continue;
+            }
+            sense_col = sense_col.push(
+                container(
+                    text(format!("\u{201C}{}\u{201D}", ex.text))
+                        .size(14)
+                        .font(italic)
+                        .color(MUTED),
+                )
+                .padding(Padding::ZERO.left(18)),
+            );
+        }
+
+        // Related words: own line, accent-colored clickable links.
+        let words: Vec<String> = sense
+            .links
+            .iter()
+            .filter_map(|l| l.first().cloned())
+            .filter(|w| !w.is_empty())
+            .collect();
+        if !words.is_empty() {
+            let mut spans = vec![span("related   ").size(13).color(MUTED)];
+            for (j, word) in words.iter().enumerate() {
+                if j > 0 {
+                    spans.push(span(" · ").size(13).color(MUTED));
+                }
+                spans.push(span(word.clone()).size(13).color(ACCENT).link(word.clone()));
+            }
+            sense_col = sense_col.push(
+                container(rich_text(spans).on_link_click(Message::LinkClicked))
+                    .padding(Padding::ZERO.left(18)),
+            );
+        }
+
+        col = col.push(sense_col);
+    }
+
+    // Etymology: small muted italic, no label.
+    if let Some(ety) = &entry.etymology_text {
+        if !ety.is_empty() {
+            col = col.push(text(ety.clone()).size(13).font(italic).color(MUTED));
+        }
+    }
+
+    col.into()
+}
+
+/// A thin horizontal divider between entries.
+fn divider() -> Element<'static, Message> {
+    container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
+        .width(Length::Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(theme.extended_palette().background.strong.color.into()),
+            ..container::Style::default()
         })
-        .subscription(subscription)
-        .run()
+        .into()
+}
+
+fn input_style(theme: &Theme, _status: text_input::Status) -> text_input::Style {
+    let palette = theme.extended_palette();
+    text_input::Style {
+        background: Color::TRANSPARENT.into(),
+        border: Border::default(),
+        icon: palette.background.weak.text,
+        placeholder: MUTED,
+        value: palette.background.base.text,
+        selection: palette.primary.weak.color,
+    }
+}
+
+/// Build the selectable language options from an edition's language list.
+pub fn lang_options(langs: &[LanguageInfo]) -> Vec<Lang> {
+    langs
+        .iter()
+        .map(|li| Lang {
+            code: li.code.clone(),
+            label: li.name.clone(),
+        })
+        .collect()
+}
+
+/// Find the option matching a language code.
+pub fn find_lang(langs: &[LanguageInfo], code: &str) -> Option<Lang> {
+    lang_options(langs).into_iter().find(|l| l.code == code)
 }
