@@ -3,3 +3,5 @@
 # Local dictionary databases (large; built by the in-app installer)
 /data/
 /dictionary.db
+
+.idea/

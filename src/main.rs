@@ -8,12 +8,15 @@ use std::collections::HashMap;
 use iced::alignment::{Horizontal, Vertical};
 use iced::event::Event;
 use iced::event::{self, Status};
+use iced::keyboard::key::Named;
+use iced::keyboard::Key;
 use iced::widget::{
-    Space, button, column, combo_box, container, progress_bar, rich_text, row, scrollable, span,
-    text, text_input,
+    button, column, combo_box, container, progress_bar, rich_text, row, scrollable, span,
+    text, text_input, Space,
 };
 use iced::{
-    Border, Color, Element, Font, Length, Padding, Subscription, Task, Theme, color, font, window,
+    color, font, keyboard, window, Border, Color, Element, Font, Length, Padding, Subscription,
+    Task, Theme,
 };
 use rusqlite::Connection;
 
@@ -50,6 +53,7 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Search,
+    Result,
     Settings,
 }
 
@@ -77,6 +81,7 @@ impl std::fmt::Display for Lang {
 pub struct App {
     screen: Screen,
     library: Library,
+    search_word: String,
     /// Read-only connection to the active edition's DB.
     conn: Option<Connection>,
     languages: Vec<LanguageInfo>,
@@ -97,6 +102,7 @@ pub struct App {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    SearchInputChanged(String),
     Navigate(Screen),
     Back,
     // Search page
@@ -107,18 +113,14 @@ pub enum Message {
     Uninstall(String),
     SetActiveEdition(String),
     InstallProgress(String, Progress),
-    // Window chrome
-    WindowDrag,
-    WindowResize(window::Direction),
-    WindowMinimize,
-    WindowMaximize,
-    WindowClose,
+    SearchSubmitted,
 }
 
 impl App {
     fn new() -> Self {
         let mut app = App {
             screen: Screen::Search,
+            search_word: String::new(),
             library: Library::load(),
             conn: None,
             languages: Vec::new(),
@@ -178,17 +180,17 @@ impl App {
 
     /// Look a word up in an explicit language and show the results.
     /// Does not touch `active_lang` or the history.
-    fn lookup(&mut self, word: &str, lang: &str) {
+    fn lookup(&mut self) {
         let Some(conn) = &self.conn else {
             return;
         };
-        let w = word.trim();
+        let w = self.search_word.trim();
         if w.is_empty() {
             self.results.clear();
             self.status = None;
             return;
         }
-        match db::lookup(conn, lang, w) {
+        match db::lookup(conn, "en", w) {
             Ok(r) if r.is_empty() => {
                 self.results.clear();
                 self.status = Some(format!("No results for \u{201C}{w}\u{201D}"));
@@ -196,7 +198,6 @@ impl App {
             Ok(r) => {
                 self.results = r;
                 self.status = None;
-                self.current_view = Some((w.to_string(), lang.to_string()));
             }
             Err(e) => {
                 self.results.clear();
@@ -209,15 +210,22 @@ impl App {
         Theme::Dracula
     }
 
-    fn update(app: &mut App, message: Message) -> Task<Message> {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Navigate(s) => app.screen = s,
+            Message::SearchInputChanged(input) => {
+                self.search_word = input;
+            }
+            Message::SearchSubmitted => {
+                self.screen = Screen::Result;
+                self.lookup();
+            }
+            Message::Navigate(s) => self.screen = s,
             Message::LangSelected(l) => {
-                app.library.set_active_lang(&l);
-                app.active_lang = Some(l.clone());
-                app.lang_selected = find_lang(&app.languages, &l);
-                let q = app.query.clone();
-                app.lookup(&q, &l);
+                self.library.set_active_lang(&l);
+                self.active_lang = Some(l.clone());
+                self.lang_selected = find_lang(&self.languages, &l);
+                let q = self.query.clone();
+                // self.lookup(&q, &l);
             }
             Message::LinkClicked(_) => {
                 // Links inside explanations always point to words in the edition's
@@ -229,14 +237,14 @@ impl App {
                 // }
             }
             Message::Back => {
-                if let Some((word, lang)) = app.history.pop() {
-                    app.query = word.clone();
-                    app.screen = Screen::Search;
-                    app.lookup(&word, &lang);
+                if let Some((word, lang)) = self.history.pop() {
+                    self.query = word.clone();
+                    self.screen = Screen::Search;
+                    // self.lookup(&word, &lang);
                 }
             }
             Message::Install(code) => {
-                app.installs.insert(
+                self.installs.insert(
                     code.clone(),
                     InstallState::Downloading {
                         received: 0,
@@ -248,80 +256,61 @@ impl App {
             Message::Uninstall(code) => {
                 let _ = std::fs::remove_file(paths::db_path(&code));
                 let was_active =
-                    app.library.active_edition().map(|e| e.code) == Some(code.as_str());
-                app.installs.remove(&code);
-                app.library.rescan();
+                    self.library.active_edition().map(|e| e.code) == Some(code.as_str());
+                self.installs.remove(&code);
+                self.library.rescan();
                 if was_active {
-                    app.library.clear_active_edition();
-                    app.open_active();
+                    self.library.clear_active_edition();
+                    self.open_active();
                 }
             }
             Message::SetActiveEdition(code) => {
-                app.library.set_active_edition(&code);
-                app.open_active();
+                self.library.set_active_edition(&code);
+                self.open_active();
             }
             Message::InstallProgress(code, prog) => match prog {
                 Progress::Downloading { received, total } => {
-                    app.installs
+                    self.installs
                         .insert(code, InstallState::Downloading { received, total });
                 }
                 Progress::Importing { entries } => {
-                    app.installs
+                    self.installs
                         .insert(code, InstallState::Importing { entries });
                 }
                 Progress::Failed(e) => {
-                    app.installs.insert(code, InstallState::Failed(e));
+                    self.installs.insert(code, InstallState::Failed(e));
                 }
                 Progress::Done { .. } => {
-                    app.installs.remove(&code);
-                    app.library.rescan();
+                    self.installs.remove(&code);
+                    self.library.rescan();
                     // Auto-activate if nothing is active yet.
-                    if app.library.active_edition().is_none() {
-                        app.library.set_active_edition(&code);
-                        app.open_active();
+                    if self.library.active_edition().is_none() {
+                        self.library.set_active_edition(&code);
+                        self.open_active();
                     }
                 }
             },
-            Message::WindowDrag => {
-                return window::latest().then(|id| match id {
-                    Some(id) => window::drag(id),
-                    None => Task::none(),
-                });
-            }
-            Message::WindowResize(dir) => {
-                return window::latest().then(move |id| match id {
-                    Some(id) => window::drag_resize(id, dir),
-                    None => Task::none(),
-                });
-            }
-            Message::WindowMinimize => {
-                return window::latest().then(|id| match id {
-                    Some(id) => window::minimize(id, true),
-                    None => Task::none(),
-                });
-            }
-            Message::WindowMaximize => {
-                return window::latest().then(|id| match id {
-                    Some(id) => window::toggle_maximize(id),
-                    None => Task::none(),
-                });
-            }
-            Message::WindowClose => {
-                return window::latest().then(|id| match id {
-                    Some(id) => window::close(id),
-                    None => Task::none(),
-                });
-            }
         }
         Task::none()
     }
 
-    pub fn search_view(&self) -> Element<'_, Message> {
-        // Results, an empty hint, or a status message.
-        let body: Element<Message> = if let Some(status) = &self.status {
-            centered_hint(status.clone())
-        } else if self.results.is_empty() {
-            centered_hint("Press Ctrl+P to search a word.".to_string())
+    fn search_view(&self) -> Element<'_, Message> {
+        container(
+            column![
+                text_input("type a word", &self.search_word)
+                    .padding(10)
+                    .on_input(Message::SearchInputChanged)
+                    .on_submit(Message::SearchSubmitted),
+            ]
+            .max_width(600),
+        )
+        .center(Length::Fill)
+        .into()
+    }
+
+    fn result_view(&self) -> Element<'_, Message> {
+        let body = if self.results.is_empty() {
+            centered_hint("No matching words found".to_string())
         } else {
             let mut col = column![].spacing(28).padding(Padding::from([0, 20]));
             for (i, entry) in self.results.iter().enumerate() {
@@ -330,16 +319,10 @@ impl App {
                 }
                 col = col.push(entry_view(entry));
             }
-            scrollable(col).height(Length::Fill).into()
+            scrollable(col.padding(24)).height(Length::Fill).into()
         };
 
-        let mut inner = column![].spacing(16).width(Length::Fill);
-        if !self.history.is_empty() {
-            inner = inner.push(breadcrumb(self));
-        }
-        inner = inner.push(body);
-
-        container(inner)
+        container(body)
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(Horizontal::Center)
@@ -408,6 +391,7 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let body = match self.screen {
             Screen::Search => self.search_view(),
+            Screen::Result => self.result_view(),
             Screen::Settings => self.settings_view(),
         };
         container(body)
@@ -432,12 +416,33 @@ fn install_task(code: String) -> Task<Message> {
     Task::run(rx, move |p| Message::InstallProgress(code.clone(), p))
 }
 
-fn on_event(_event: Event, _status: Status, _id: window::Id) -> Option<Message> {
-    None
-}
-
 fn subscription(_app: &App) -> Subscription<Message> {
-    event::listen_with(on_event)
+    event::listen_with(|event: Event, _status: Status, _id: window::Id| {
+        let Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            text,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+
+        if modifiers.command() {
+            if let Key::Character(c) = &key {
+                match c.as_str().to_ascii_lowercase().as_str() {
+                    "," => return Some(Message::Navigate(Screen::Settings)),
+                    _ => {}
+                }
+            }
+            return None;
+        }
+
+        match key {
+            Key::Named(Named::Escape) => Some(Message::Navigate(Screen::Search)),
+            _ => None,
+        }
+    })
 }
 
 fn install_status(state: &InstallState) -> Element<'_, Message> {
