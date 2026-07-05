@@ -100,16 +100,37 @@ fn import_file(
     db::init_schema(&conn)?;
     conn.pragma_update(None, "journal_mode", "OFF")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
 
     let mut counts: HashMap<String, u64> = HashMap::new();
     let mut count = 0u64;
 
+    // Rows are batched into multi-row INSERTs rather than executed one at a
+    // time: preparing/stepping the SQLite VM has fixed per-statement
+    // overhead, so one statement covering `BATCH_SIZE` rows is noticeably
+    // cheaper than `BATCH_SIZE` separate single-row statements, even though
+    // both run inside the same transaction. 100 rows * 5 columns = 500 bound
+    // parameters, comfortably under SQLite's (even old, pre-3.32) default
+    // limit of 999.
+    const BATCH_SIZE: usize = 100;
+
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO entries (word, word_norm, lang_code, pos, data)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
+        let single_sql = "INSERT INTO entries (word, word_norm, lang_code, pos, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)";
+        let mut single_stmt = tx.prepare(single_sql)?;
+
+        let batch_sql = format!(
+            "INSERT INTO entries (word, word_norm, lang_code, pos, data) VALUES {}",
+            std::iter::repeat("(?,?,?,?,?)")
+                .take(BATCH_SIZE)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut batch_stmt = tx.prepare(&batch_sql)?;
+
+        let mut batch: Vec<[String; 5]> = Vec::with_capacity(BATCH_SIZE);
 
         for line in reader.lines() {
             let line = line?;
@@ -126,19 +147,24 @@ fn import_file(
 
             let norm = entry.word.to_lowercase();
             let data = serde_json::to_string(&entry)?;
-            stmt.execute(rusqlite::params![
-                entry.word,
-                norm,
-                entry.lang_code,
-                entry.pos,
-                data
-            ])?;
-
             *counts.entry(entry.lang_code.clone()).or_default() += 1;
+            batch.push([entry.word, norm, entry.lang_code, entry.pos, data]);
+
+            if batch.len() == BATCH_SIZE {
+                let flat = batch.iter().flat_map(|row| row.iter().map(String::as_str));
+                batch_stmt.execute(rusqlite::params_from_iter(flat))?;
+                batch.clear();
+            }
+
             count += 1;
             if count % 50_000 == 0 {
                 on_progress(Progress::Importing { entries: count });
             }
+        }
+
+        // Flush the remaining rows (fewer than `BATCH_SIZE`) one at a time.
+        for row in &batch {
+            single_stmt.execute(rusqlite::params![row[0], row[1], row[2], row[3], row[4]])?;
         }
     }
     tx.commit()?;
