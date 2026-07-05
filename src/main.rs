@@ -90,6 +90,11 @@ pub struct App {
     /// Searchable language switcher state + its currently selected option.
     lang_state: combo_box::State<Lang>,
     lang_selected: Option<Lang>,
+    /// Live autocomplete matches for the text currently in the search box.
+    suggestions: Vec<String>,
+    /// Index into `suggestions` highlighted by arrow-key navigation; the
+    /// first match is always selected by default.
+    selected_suggestion: usize,
     results: Vec<Entry>,
     status: Option<String>,
     /// The (word, language) currently displayed (last successful lookup).
@@ -109,6 +114,9 @@ pub enum Message {
     // Search page
     LangSelected(String),
     LinkClicked(String),
+    SuggestionClicked(String),
+    SuggestionUp,
+    SuggestionDown,
     // Settings page
     Install(String),
     Uninstall(String),
@@ -128,6 +136,8 @@ impl App {
             active_lang: None,
             lang_state: combo_box::State::new(Vec::new()),
             lang_selected: None,
+            suggestions: Vec::new(),
+            selected_suggestion: 0,
             results: Vec::new(),
             status: None,
             current_view: None,
@@ -143,6 +153,7 @@ impl App {
         self.conn = None;
         self.languages.clear();
         self.results.clear();
+        self.suggestions.clear();
         self.lang_state = combo_box::State::new(Vec::new());
         self.lang_selected = None;
 
@@ -217,6 +228,19 @@ impl App {
         self.current_view = Some((w, lang));
     }
 
+    /// Refresh the live autocomplete list shown under the search box.
+    fn refresh_suggestions(&mut self) {
+        let word = self.search_word.trim();
+        let Some(conn) = (if word.is_empty() { None } else { self.conn.as_ref() }) else {
+            self.suggestions.clear();
+            self.selected_suggestion = 0;
+            return;
+        };
+        let lang = self.active_lang.clone().unwrap_or_else(|| "en".to_string());
+        self.suggestions = db::search_words(conn, &lang, word, 8).unwrap_or_default();
+        self.selected_suggestion = 0;
+    }
+
     /// Navigate to `word` in `lang` from within the result view (e.g. a
     /// related-word link), pushing the word currently on display onto the
     /// back history.
@@ -244,11 +268,34 @@ impl App {
                 if self.conn.is_some() {
                     self.status = None;
                 }
+                self.refresh_suggestions();
             }
             Message::SearchSubmitted => {
+                // With suggestions showing, submit always picks the
+                // highlighted one (the first match by default) rather than
+                // whatever partial text is still in the box.
+                if let Some(word) = self.suggestions.get(self.selected_suggestion).cloned() {
+                    self.search_word = word;
+                }
                 self.screen = Screen::Result;
                 self.lookup();
                 self.search_word.clear();
+                self.suggestions.clear();
+            }
+            Message::SuggestionClicked(word) => {
+                self.search_word = word;
+                self.screen = Screen::Result;
+                self.lookup();
+                self.search_word.clear();
+                self.suggestions.clear();
+            }
+            Message::SuggestionUp => {
+                self.selected_suggestion = self.selected_suggestion.saturating_sub(1);
+            }
+            Message::SuggestionDown => {
+                if self.selected_suggestion + 1 < self.suggestions.len() {
+                    self.selected_suggestion += 1;
+                }
             }
             Message::Navigate(s) => {
                 if s == self.screen {
@@ -379,6 +426,31 @@ impl App {
                 .on_input(Message::SearchInputChanged)
                 .on_submit(Message::SearchSubmitted),
         );
+
+        if !self.suggestions.is_empty() {
+            let mut sug_col = column![];
+            for (i, word) in self.suggestions.iter().enumerate() {
+                if i > 0 {
+                    sug_col = sug_col.push(divider());
+                }
+                let is_selected = i == self.selected_suggestion;
+                sug_col = sug_col.push(
+                    button(text(word.clone()).size(14))
+                        .style(move |theme: &Theme, status: button::Status| {
+                            let mut style = button::text(theme, status);
+                            if is_selected {
+                                style.background =
+                                    Some(theme.extended_palette().background.weak.color.into());
+                            }
+                            style
+                        })
+                        .padding(Padding::from([6, 10]))
+                        .width(Length::Fill)
+                        .on_press(Message::SuggestionClicked(word.clone())),
+                );
+            }
+            col = col.push(sug_col);
+        }
 
         if let Some(status) = &self.status {
             col = col.push(text(status.clone()).size(13).color(MUTED));
@@ -550,6 +622,8 @@ fn subscription(_app: &App) -> Subscription<Message> {
 
         match key {
             Key::Named(Named::Escape) => Some(Message::Navigate(Screen::Search)),
+            Key::Named(Named::ArrowUp) => Some(Message::SuggestionUp),
+            Key::Named(Named::ArrowDown) => Some(Message::SuggestionDown),
             _ => None,
         }
     })
