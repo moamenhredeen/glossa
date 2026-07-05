@@ -13,7 +13,7 @@ use iced::keyboard::key::Named;
 use iced::keyboard::Key;
 use iced::widget::{
     button, column, combo_box, container, operation, progress_bar, rich_text, row, scrollable,
-    span, text, text_input, Space,
+    span, stack, text, text_input, Space,
 };
 use iced::{
     color, font, keyboard, window, Border, Color, Element, Font, Length, Padding, Subscription,
@@ -384,7 +384,17 @@ impl App {
             col = col.push(text(status.clone()).size(13).color(MUTED));
         }
 
-        container(col).center(Length::Fill).into()
+        let settings_button = container(
+            button(text("\u{2699}").size(24).color(MUTED))
+                .style(button::text)
+                .on_press(Message::Navigate(Screen::Settings)),
+        )
+        .padding(16)
+        .align_x(Horizontal::Right)
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        stack![container(col).center(Length::Fill), settings_button].into()
     }
 
     fn result_view(&self) -> Element<'_, Message> {
@@ -474,12 +484,18 @@ impl App {
             col = col.push(entry_row);
         }
 
-        column![
-            container(text("Dictionaries").size(24)).padding(24),
-            scrollable(col)
+        let header = row![
+            button(text("\u{2039}").size(24))
+                .style(button::text)
+                .padding(5)
+                .on_press(Message::Navigate(Screen::Search)),
+            text("Dictionaries").size(24),
         ]
-        .spacing(24)
-        .into()
+        .spacing(12)
+        .align_y(Vertical::Center)
+        .padding(24);
+
+        column![header, scrollable(col)].spacing(24).into()
     }
 
     fn view(&self) -> Element<'_, Message> {
