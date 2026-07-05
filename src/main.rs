@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use iced::alignment::{Horizontal, Vertical};
+use iced::border::Radius;
 use iced::event::Event;
 use iced::event::{self, Status};
 use iced::keyboard::key::Named;
@@ -89,7 +90,6 @@ pub struct App {
     /// Searchable language switcher state + its currently selected option.
     lang_state: combo_box::State<Lang>,
     lang_selected: Option<Lang>,
-    query: String,
     results: Vec<Entry>,
     status: Option<String>,
     /// The (word, language) currently displayed (last successful lookup).
@@ -105,6 +105,7 @@ pub enum Message {
     SearchInputChanged(String),
     Navigate(Screen),
     Back,
+    GoToCrumb(usize),
     // Search page
     LangSelected(String),
     LinkClicked(String),
@@ -127,7 +128,6 @@ impl App {
             active_lang: None,
             lang_state: combo_box::State::new(Vec::new()),
             lang_selected: None,
-            query: String::new(),
             results: Vec::new(),
             status: None,
             current_view: None,
@@ -178,22 +178,15 @@ impl App {
         }
     }
 
-    /// Look a word up in an explicit language and show the results.
-    /// Does not touch `active_lang` or the history.
-    fn lookup(&mut self) {
+    /// Run a lookup for `word` in `lang` and populate `results`/`status`.
+    fn run_lookup(&mut self, word: &str, lang: &str) {
         let Some(conn) = &self.conn else {
             return;
         };
-        let w = self.search_word.trim();
-        if w.is_empty() {
-            self.results.clear();
-            self.status = None;
-            return;
-        }
-        match db::lookup(conn, "en", w) {
+        match db::lookup(conn, lang, word) {
             Ok(r) if r.is_empty() => {
                 self.results.clear();
-                self.status = Some(format!("No results for \u{201C}{w}\u{201D}"));
+                self.status = Some(format!("No results for \u{201C}{word}\u{201D}"));
             }
             Ok(r) => {
                 self.results = r;
@@ -206,6 +199,38 @@ impl App {
         }
     }
 
+    /// Look up the word typed on the Search screen, in the active headword
+    /// language. This starts a fresh navigation trail.
+    fn lookup(&mut self) {
+        let w = self.search_word.trim().to_string();
+        if w.is_empty() {
+            self.results.clear();
+            self.status = None;
+            return;
+        }
+        if self.conn.is_none() {
+            return;
+        }
+        let lang = self.active_lang.clone().unwrap_or_else(|| "en".to_string());
+        self.history.clear();
+        self.run_lookup(&w, &lang);
+        self.current_view = Some((w, lang));
+    }
+
+    /// Navigate to `word` in `lang` from within the result view (e.g. a
+    /// related-word link), pushing the word currently on display onto the
+    /// back history.
+    fn navigate(&mut self, word: String, lang: String) {
+        if self.conn.is_none() {
+            return;
+        }
+        if let Some(prev) = self.current_view.take() {
+            self.history.push(prev);
+        }
+        self.run_lookup(&word, &lang);
+        self.current_view = Some((word, lang));
+    }
+
     fn theme(&self) -> Theme {
         Theme::Dracula
     }
@@ -214,6 +239,11 @@ impl App {
         match message {
             Message::SearchInputChanged(input) => {
                 self.search_word = input;
+                // Installed-dictionary hints aside, don't let a stale result
+                // message linger while the user is typing a new query.
+                if self.conn.is_some() {
+                    self.status = None;
+                }
             }
             Message::SearchSubmitted => {
                 self.screen = Screen::Result;
@@ -233,23 +263,38 @@ impl App {
                 self.library.set_active_lang(&l);
                 self.active_lang = Some(l.clone());
                 self.lang_selected = find_lang(&self.languages, &l);
-                let q = self.query.clone();
-                // self.lookup(&q, &l);
+                // Re-run whatever's currently on display in the new language.
+                if let Some((word, _)) = self.current_view.clone() {
+                    self.run_lookup(&word, &l);
+                    self.current_view = Some((word, l));
+                }
             }
-            Message::LinkClicked(_) => {
+            Message::LinkClicked(word) => {
                 // Links inside explanations always point to words in the edition's
                 // gloss language, so look them up there — without changing the user's
                 // selected headword language.
-                // if let Some(edition) = app.library.active_edition() {
-                //     let gloss = edition.code.to_string();
-                //     app.navigate(w, gloss);
-                // }
+                let gloss = self
+                    .library
+                    .active_edition()
+                    .map(|e| e.code.to_string())
+                    .unwrap_or_else(|| "en".to_string());
+                self.navigate(word, gloss);
             }
             Message::Back => {
                 if let Some((word, lang)) = self.history.pop() {
-                    self.query = word.clone();
+                    self.current_view = Some((word.clone(), lang.clone()));
+                    self.run_lookup(&word, &lang);
+                } else {
                     self.screen = Screen::Search;
-                    // self.lookup(&word, &lang);
+                    return operation::focus("search_input");
+                }
+            }
+            Message::GoToCrumb(i) => {
+                if i < self.history.len() {
+                    let (word, lang) = self.history[i].clone();
+                    self.history.truncate(i);
+                    self.current_view = Some((word.clone(), lang.clone()));
+                    self.run_lookup(&word, &lang);
                 }
             }
             Message::Install(code) => {
@@ -304,23 +349,62 @@ impl App {
     }
 
     fn search_view(&self) -> Element<'_, Message> {
-        container(
-            column![
-                text_input("type a word", &self.search_word)
-                    .id("search_input")
-                    .padding(10)
-                    .on_input(Message::SearchInputChanged)
-                    .on_submit(Message::SearchSubmitted),
-            ]
-            .max_width(600),
-        )
-        .center(Length::Fill)
-        .into()
+        let mut col = column![].spacing(25).max_width(600);
+
+        // Only worth showing when the active edition actually has more than
+        // one headword language to choose between.
+        if self.languages.len() > 1 {
+            col = col.push(
+                container(
+                    combo_box(
+                        &self.lang_state,
+                        "Language",
+                        self.lang_selected.as_ref(),
+                        |l: Lang| Message::LangSelected(l.code),
+                    )
+                    .size(13)
+                    .padding(4)
+                    .input_style(input_style)
+                    .width(140),
+                )
+                .align_x(Horizontal::Center)
+                .width(Length::Fill),
+            );
+        }
+
+        col = col.push(
+            text_input("type a word", &self.search_word)
+                .id("search_input")
+                .padding(10)
+                .on_input(Message::SearchInputChanged)
+                .on_submit(Message::SearchSubmitted),
+        );
+
+        if let Some(status) = &self.status {
+            col = col.push(text(status.clone()).size(13).color(MUTED));
+        }
+
+        container(col).center(Length::Fill).into()
     }
 
     fn result_view(&self) -> Element<'_, Message> {
+        let header = row![
+            button(text("\u{2039} Back").size(13))
+                .style(button::text)
+                .padding(0)
+                .on_press(Message::Back),
+            breadcrumb(self),
+        ]
+        .spacing(12)
+        .align_y(Vertical::Center)
+        .padding(Padding::from([12, 20]));
+
         let body = if self.results.is_empty() {
-            centered_hint("No matching words found".to_string())
+            let message = self
+                .status
+                .clone()
+                .unwrap_or_else(|| "No matching words found".to_string());
+            centered_hint(message)
         } else {
             let mut col = column![].spacing(28).padding(Padding::from([0, 20]));
             for (i, entry) in self.results.iter().enumerate() {
@@ -332,7 +416,7 @@ impl App {
             scrollable(col.padding(24)).height(Length::Fill).into()
         };
 
-        container(body)
+        container(column![header, body])
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(Horizontal::Center)
@@ -486,12 +570,12 @@ fn install_status(state: &InstallState) -> Element<'_, Message> {
 /// is shown plain at the end.
 fn breadcrumb(app: &App) -> Element<'_, Message> {
     let mut trail = row![].spacing(6).align_y(Vertical::Center);
-    for (_i, (word, _lang)) in app.history.iter().enumerate() {
+    for (i, (word, _lang)) in app.history.iter().enumerate() {
         trail = trail.push(
             button(text(word.clone()).size(13).color(ACCENT))
                 .style(button::text)
-                .padding(0),
-            //.on_press(Message::GoToCrumb(i)),
+                .padding(0)
+                .on_press(Message::GoToCrumb(i)),
         );
         trail = trail.push(text("\u{203A}").size(13).color(MUTED)); // ›
     }
@@ -621,8 +705,14 @@ fn divider() -> Element<'static, Message> {
 fn input_style(theme: &Theme, _status: text_input::Status) -> text_input::Style {
     let palette = theme.extended_palette();
     text_input::Style {
-        background: Color::TRANSPARENT.into(),
-        border: Border::default(),
+        // A subtle lift off the background rather than a saturated
+        // secondary fill — the switcher should recede, not pop.
+        background: palette.background.weak.color.into(),
+        border: Border {
+            color: Default::default(),
+            width: 0.0,
+            radius: Radius::new(4.0),
+        },
         icon: palette.background.weak.text,
         placeholder: MUTED,
         value: palette.background.base.text,
