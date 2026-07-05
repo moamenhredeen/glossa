@@ -466,7 +466,21 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        stack![container(col).center(Length::Fill), settings_button].into()
+        // Anchored from the top with a fixed offset rather than vertically
+        // centered: a column lays out children top-down from that fixed
+        // point, so the input's position stays put as the suggestion list
+        // grows or shrinks below it. True vertical centering would recompute
+        // the offset from the total (variable) height on every keystroke.
+        let anchored = container(col)
+            .width(Length::Fill)
+            .align_x(Horizontal::Center)
+            .padding(Padding::from([160, 0]));
+
+        stack![
+            container(anchored).width(Length::Fill).height(Length::Fill),
+            settings_button
+        ]
+        .into()
     }
 
     fn result_view(&self) -> Element<'_, Message> {
