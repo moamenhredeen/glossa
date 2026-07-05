@@ -22,6 +22,27 @@ pub struct Entry {
     pub senses: Vec<Sense>,
     #[serde(default)]
     pub sounds: Vec<Sound>,
+    /// Grammatical tags for the headword as a whole, e.g. `"masculine"` for a
+    /// German noun.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Inflected forms (a declension/conjugation table), when the source
+    /// records one.
+    #[serde(default)]
+    pub forms: Vec<Form>,
+}
+
+impl Entry {
+    /// The nominative-singular definite article for this headword, if the
+    /// source data recorded one (e.g. German nouns: "der"/"die"/"das").
+    pub fn article(&self) -> Option<&str> {
+        self.forms
+            .iter()
+            .find(|f| {
+                f.tags.iter().any(|t| t == "nominative") && f.tags.iter().any(|t| t == "singular")
+            })
+            .and_then(|f| f.article.as_deref())
+    }
 }
 
 /// A single sense (meaning) of an entry.
@@ -48,4 +69,16 @@ pub struct Example {
 pub struct Sound {
     #[serde(default)]
     pub ipa: Option<String>,
+}
+
+/// One inflected form — a single row of a declension or conjugation table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Form {
+    #[serde(default)]
+    pub form: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// The definite article accompanying this form, when the language has one.
+    #[serde(default)]
+    pub article: Option<String>,
 }

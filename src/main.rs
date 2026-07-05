@@ -712,12 +712,15 @@ fn entry_view(entry: &Entry) -> Element<'static, Message> {
     let mut col = column![].spacing(10);
 
     // Headword (left, large+bold) with POS pushed to the right (muted).
+    // Nouns in languages that mark gender via an article (e.g. German) show
+    // it ahead of the word, the way a print dictionary would.
+    let headword = match entry.article() {
+        Some(article) => format!("{article} {}", entry.word),
+        None => entry.word.clone(),
+    };
     col = col.push(
         row![
-            text(entry.word.clone())
-                .size(30)
-                .font(bold)
-                .width(Length::Fill),
+            text(headword).size(30).font(bold).width(Length::Fill),
             text(entry.pos.clone()).size(14).color(MUTED),
         ]
         .align_y(Vertical::Center),
